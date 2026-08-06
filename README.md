@@ -1,122 +1,151 @@
-# LLM Output Risk Validation Framework
+# LLM Output Risk Validation Report
 
-Something that's been bothering me about the current wave of AI deployments in Indian banking: everyone is racing to put LLMs into customer-facing products — chatbots for credit card queries, digital lending assistants, grievance handling bots — but almost nobody has a rigorous way to validate whether those models are actually safe to deploy. The traditional model validation frameworks were designed for regression and classification models. They don't translate cleanly to generative AI.
+## Objective
 
-RBI acknowledged this gap in its May 2023 Draft Circular on Model Risk Management, which called for banks to establish governance frameworks for AI/ML models. But a circular that says "you need a framework" doesn't tell you what the framework should look like for a generative model. This project is my attempt to build one.
+Answer one question before a model goes live, not after something breaks: **is this LLM safe enough to deploy as a customer-facing financial assistant?**
 
-The idea is straightforward — take a Gemini model, put on the hat of an MRMG validator whose job is to challenge it before it goes live as a financial assistant, and test it across four dimensions that actually matter for consumer-facing deployment in India: factual accuracy on RBI regulations, answer consistency, adversarial robustness, and compliance with RBI's Fair Practices Code.
+Traditional model risk management was built for scorecards and classifiers — check calibration, stability, drift. None of that vocabulary was designed for a model that writes sentences. RBI's 2023 Draft Circular on Model Risk Management requires banks to govern their AI/ML models but doesn't prescribe how to validate a generative one. This project builds that missing layer and runs it against a real model, producing a real, defensible risk score — not a hypothetical framework.
 
----
-
-## Why these four tests
-
-**Hallucination** is the most critical one for a financial chatbot. A model that misquotes RBI's fraud liability rules, gets the Banking Ombudsman complaint timeline wrong, or invents a credit card fee cap that doesn't exist — that's a model that will actively harm customers. I built a dataset of 20 questions grounded entirely in RBI regulations, with verified correct answers. The test measures what fraction of the time the model gets them right.
-
-**Consistency** is less obvious but equally important in practice. If a customer asks "how many days do I have to report card fraud" and gets "3 working days" once and "7 days" another time, the model is unreliable in a context where the exact answer affects the customer's legal liability. The consistency test measures answer variance across five paraphrased versions of the same question.
-
-**Adversarial robustness** tests whether the model pushes back when a question contains a false premise. Real customers often arrive with misinformation — "I heard once my card is stolen, I'm responsible for everything, right?" A trustworthy financial assistant should correct that, not confirm it. This test checks exactly that.
-
-**RBI Fair Practices Code compliance** is the Indian equivalent of what the US calls UDAAP testing. RBI's Fair Practices Code prohibits misleading advertisements, hidden charges, and deceptive benefit claims by banks. An LLM generating marketing content or customer communications can easily produce language that sounds helpful but violates these norms. This module scans outputs for patterns that a compliance officer would flag.
+The deeper goal is to demonstrate the instinct MRMG teams actually work with: assume the model is wrong somewhere, go find exactly where, and write it up in language a risk committee can act on. Not "build a chatbot" — challenge one.
 
 ---
 
-## The regulatory foundation
+## Problem
 
-Everything in this project is grounded in actual RBI circulars and acts. The Q&A dataset references:
+A financial LLM fails in ways a traditional model can't, and each failure mode needs its own test:
 
-- RBI Circular on Customer Protection in Unauthorised Electronic Banking Transactions (2017) — fraud liability rules, zero liability within 3 working days
-- RBI Master Circular on Credit Card, Debit Card and Rupay Prepaid Card Operations (2022) — 30-day rate change notice, 15-day statement delivery, over-limit consent
-- RBI Integrated Ombudsman Scheme (2021) — grievance escalation, ₹20 lakh compensation ceiling
-- RBI Digital Lending Guidelines (2022) — Key Fact Statement requirements, prohibition on auto-disbursement
-- Credit Information Companies (Regulation) Act 2005 (CICRA) — CIBIL and credit bureau regulation
-- RBI Draft Circular on Model Risk Management (2023) — the framework this entire project is built around
+- It can **state a wrong fact with total confidence** — misquote a fraud liability cap, invent a fee that doesn't exist. In a regulated context that's not a bug, it's a compliance incident.
+- It can **answer the same question differently depending on phrasing**, so a customer's actual rights depend on how casually they asked, not on the rule itself.
+- It can **agree with a customer's wrong assumption** instead of correcting it, actively reinforcing misinformation about their own liability.
+- It can **generate copy that reads fine but violates RBI's Fair Practices Code** — deceptive claims, missing disclosures — without anyone flagging it before it ships.
 
-Where RBI guidance draws from established international standards, the project also references SR 11-7 — the US Federal Reserve's model risk framework that AmEx's global MRM policy is built on. Foreign banks operating in India work under both: RBI as the external regulator, and their parent company's internal standards which trace back to the Fed. Knowing both is the right answer.
+No single metric like "accuracy" captures any of this. Four failure modes, four separate tests.
+
+---
+
+## Cases
+
+Twenty test cases in `financial_qa.json`, every one grounded in an actual RBI circular:
+
+| Area | Example |
+|---|---|
+| Fraud liability (RBI 2017) | Zero liability if reported within 3 working days; ₹10,000 cap for 4-7 days on cards under ₹5 lakh |
+| Credit card master circular (RBI 2022) | 30-day rate change notice, 15-day statement delivery, mandatory MITC disclosure |
+| Ombudsman scheme (2021) | 30-day bank resolution window, ₹20 lakh compensation ceiling |
+| Digital lending (RBI 2022) | Key Fact Statement required before disbursal, no auto-disbursement without consent |
+| Credit bureaus | CICRA 2005, CIBIL score range and the 750+ good-score threshold |
+| Fair Practices Code | Two prompts designed to elicit misleading marketing language |
+| Math | APR-to-daily-rate and balance transfer calculations at Indian rates (42% APR, not the 15-25% a US-trained instinct might assume) |
+
+Each case also ships an **adversarial version** — the same question reframed with a false premise baked in.
+
+---
+
+## Tech
+
+```
+google-genai      current official Gemini SDK
+difflib           consistency scoring — Python stdlib
+re                Fair Practices pattern matching — Python stdlib
+json, os, time    orchestration — Python stdlib
+```
+
+One external dependency. The report is built as plain Markdown strings, no template engine — short enough to read start to finish.
+
+---
+
+## Model
+
+**`gemini-3.1-flash-lite`**, via the current `google-genai` SDK. Chosen because the workload is high-volume, low-complexity — roughly 80-90 short factual calls per run — exactly what Flash-Lite is priced and rate-limited for, versus a reasoning-heavy task that would justify Pro. Free-tier eligible, no billing setup required.
+
+Factual tests run at `temperature=0.2` for minimal drift; consistency and Fair Practices tests run at `0.3-0.4` for enough natural variation to actually stress-test stability. Each call gets one automatic retry with backoff on a rate limit, so a 429 doesn't silently drop a result.
+
+---
+
+## Wireframe
+
+```mermaid
+flowchart TD
+    A[financial_qa.json<br/>20 RBI-grounded Q&A] --> B[main.py]
+    B --> C{run_all_validators}
+    C --> D[HallucinationTester<br/>keyword + similarity match]
+    C --> E[ConsistencyTester<br/>5 paraphrases, pairwise similarity]
+    C --> F[AdversarialTester<br/>correction vs agreement signals]
+    C --> G[UDAAPAuditor<br/>regex pattern scan]
+    D & E & F & G --> H[gemini-3.1-flash-lite<br/>via google-genai]
+    H -.rate-limited, retried.-> D & E & F & G
+    D & E & F & G --> I[Composite Risk Score<br/>40/30/20/10 weighted]
+    I --> J[mrm_llm_validation_report.md]
+```
+
+---
+
+## Results — Actual Run, 06 August 2026
+
+This isn't a hypothetical output shape. This is what the model actually did.
+
+| Metric | Result | Target | Status |
+|---|---|---|---|
+| Hallucination Rate | 0% (18/18) | < 5% | ✅ |
+| Adversarial Vulnerability | 0% (18/18) | < 10% | ✅ |
+| Fair Practices Risk Score | 2.0 (1 pass, 3 warn, 0 fail) | < 2.0 | ⚠️ |
+| Consistency Score | 0.43 (3/8) | > 0.70 | ❌ |
+
+**Overall: 🟢 Low Risk — Composite Score 5.7 / 100**
+
+### What this actually means
+
+The model got every single fact right and never once agreed with a false premise a customer might bring in — those two results are genuinely strong and not a given, since a model with weaker grounding in Indian regulation could easily default toward US-style rules (60-day dispute windows, $50 fraud caps) instead of RBI's actual numbers.
+
+The real finding is consistency, and it's the one number that should drive the conclusion, not the headline score. Asked the same regulatory question five different ways, the model gave meaningfully different-shaped answers more than half the time — two questions (fraud liability tiers, CIBIL score) scored below 0.20, close to no consistency at all. This doesn't mean the model was factually wrong five times; the hallucination test already ruled that out. It means the level of detail and framing shifts with how the question is asked — which matters in a regulated context, because a customer who asks casually shouldn't get a materially thinner answer than one who asks formally.
+
+Worth understanding before presenting this number: the composite score formula weights hallucination and adversarial failures at 40% and 30%, but the UDAAP term is calculated as `failed / total` — and all three flagged Fair Practices responses landed in WARN, not FAIL. So despite 3 compliance flags, UDAAP contributes zero to the score. The entire 5.7 is almost purely the consistency penalty: `(1 − 0.43) × 10 ≈ 5.7`. The score alone would hide the compliance warnings; the Key Findings section in the actual report is where they surface for a human reader. That's a deliberate scoring design choice worth being able to explain, not a flaw to gloss over.
+
+**One-line takeaway:** factually reliable and resistant to misinformation, not yet consistent enough for unsupervised customer-facing deployment.
+
+---
+
+## Output
+
+A single Markdown report — `mrm_llm_validation_report.md` — chosen over JSON or HTML so it's easy to hand to someone: renders automatically on GitHub, pastes cleanly into Slack or email, opens in any text editor.
+
+```
+# LLM Output Risk Validation Report
+Model, domain, date, regulatory alignment
+
+## Overall Rating
+## 1. Executive Summary          → 4-metric table vs. target thresholds
+## 2. Key Findings                → auto-generated, severity-tagged
+## 3. Hallucination Test          → per-question pass/fail table
+## 4. Consistency Test            → per-question consistency score table
+## 5. Adversarial Robustness      → per-question corrected-or-not table
+## 6. RBI Fair Practices Audit    → per-response risk score table
+## 7. Conditions for Deployment   → threshold vs. actual, pass/fail
+## 8. Recommended Guardrails      → numbered action list
+```
 
 ---
 
 ## Running it
 
-You need Python and a Gemini API key. The key is free — go to `aistudio.google.com`, click Get API key, and copy it.
-
 ```bash
-cd project2_llm_risk
 pip install -r requirements.txt
-```
-
-Set your key and run:
-
-```bash
-# Mac / Linux
-export GEMINI_API_KEY="your-key-here"
-python main.py
-
-# Windows
-set GEMINI_API_KEY=your-key-here
+export GEMINI_API_KEY="your-key"     # free at aistudio.google.com
 python main.py
 ```
 
-Takes about 5 minutes because of API rate limit pauses built in. When done, open:
-
-- `mrm_llm_validation_report.html` — the full validation report
-- `validation_results.json` — raw results for further analysis
+Takes 5-8 minutes — the pacing between calls is intentional, keeping the run inside Gemini's free-tier rate limit.
 
 ---
 
-## What the Q&A dataset covers
+## Honest limitations
 
-Twenty questions, all India-specific:
+**Consistency scoring uses `difflib`, not semantic embeddings.** Two answers that say the same thing in different words can score lower than they should. A production system should use sentence embeddings instead — the low consistency scores here are a real signal, but the exact numbers would likely shift with a better similarity metric.
 
-- Fraud liability tiers under RBI 2017 circular (zero liability within 3 days, ₹10,000 cap within 4-7 days)
-- Rate change and statement delivery notice periods under RBI 2022 master circular
-- Banking Ombudsman escalation timelines and ₹20 lakh compensation ceiling
-- CIBIL score ranges and what constitutes a good score in India (750+)
-- NACH mandate cancellation rights
-- Digital lending KFS requirements under RBI 2022 guidelines
-- Pre-approved loan disbursement consent rules
-- MITC disclosure requirements
-- RBI Fair Practices Code scenarios (Indian equivalent of UDAAP)
-- APR calculations at Indian rates (42% is common here vs 15-25% in the US)
+**The Fair Practices auditor is regex, not a trained classifier.** It catches obvious violations, not subtle ones. Real compliance review still needs a human.
 
-None of these questions have the same correct answer as their US equivalents. The dispute window is 30 days in India, not 60. The fraud liability cap is ₹10,000 for most credit cards, not $50. The statement delivery window is 15 days, not 21. These differences matter and they're all baked into the test.
+**Twenty questions is a framework, not full coverage.** Foreign transaction fees, EMI conversion, and co-branded card terms aren't tested yet. Add cases to `financial_qa.json` and they're picked up automatically.
 
----
+**The composite score can understate compliance risk.** As shown in this run, WARN-level Fair Practices flags don't move the score the way a FAIL does. Anyone reading only the headline number would miss three flagged responses — the findings section, not the score, is where that risk actually shows up.
 
-## How scoring works
-
-Each test produces a pass/fail per question, then rolls up:
-
-| Metric | Target |
-|---|---|
-| Hallucination rate | Below 5% |
-| Consistency score | Above 0.70 |
-| Adversarial vulnerability | Below 10% |
-| Fair Practices violations | Zero high-risk outputs |
-
-These combine into a composite risk score from 0 to 100. The HTML report translates this into a deployment recommendation: Low Risk (can deploy with monitoring), Medium Risk (conditional deployment with guardrails), or High Risk (not suitable for production).
-
----
-
-## What this doesn't do
-
-Worth being honest about a few things.
-
-The consistency check uses string similarity via Python's difflib. It's a rough approximation — two semantically identical answers phrased differently might score low, and two superficially similar but contradictory answers might score high. A production-grade consistency checker would use sentence embeddings. I kept it dependency-light intentionally.
-
-The Fair Practices Code scanner uses regex pattern matching, not a trained classifier. It catches obvious language but will miss subtle violations. Real compliance review requires human legal judgment — this is first-pass screening only.
-
-The dataset has 20 questions. That's enough to be meaningful but not enough to be statistically robust across all areas of RBI credit card regulation. Treat it as a framework you can extend, not a comprehensive test suite.
-
----
-
-## Tech stack
-
-```
-google-generativeai   — Gemini API client
-difflib               — consistency scoring (Python stdlib)
-re                    — Fair Practices Code pattern matching (Python stdlib)
-json, os, time        — everything else (stdlib)
-```
-
-One pip install. The HTML report generator is pure Python — no Jinja2, no template engine, just f-strings. Ugly under the hood, clean in the browser, zero additional dependencies.
 
